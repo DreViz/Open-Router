@@ -100,6 +100,9 @@ type CompletionResponse struct {
 }
 
 // StreamChunk represents a single SSE chunk during streaming.
+//
+// The last chunk in a stream may include Usage (token counts for billing).
+// OpenAI sends this when stream_options.include_usage is true.
 type StreamChunk struct {
 	ID      string  `json:"id"`
 	Object  string  `json:"object"`
@@ -113,6 +116,7 @@ type StreamChunk struct {
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *Usage `json:"usage,omitempty"`
 }
 
 // ─── Model Registry Types (Phase 2) ───

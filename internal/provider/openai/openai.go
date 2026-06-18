@@ -1,15 +1,18 @@
 package openai
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/dreviz/openrouter/internal/model"
+	"github.com/dreviz/openrouter/internal/provider"
 )
 
 // ──────────────────────────────────────────────────────
@@ -199,7 +202,164 @@ func (p *OpenAIProvider) Complete(ctx context.Context, req *model.CompletionRequ
 	}, nil
 }
 
-// Models returns the models available from this provider.
+// ──────────────────────────────────────────────────────
+// Stream sends a streaming request to OpenAI and forwards chunks.
+//
+// HOW STREAMING WORKS (the big picture):
+//
+// NORMAL request:
+//   Client → OpenAI → [generates full response] → Client gets everything at once
+//
+// STREAMING request:
+//   Client → OpenAI → OpenAI sends tokens one at a time → we forward each one
+//
+// The upstream API uses Server-Sent Events (SSE) format:
+//
+//	data: {"choices":[{"delta":{"content":"Hello"}}]}
+//
+//	data: {"choices":[{"delta":{"content":" world"}}]}
+//
+//	data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+//
+//	data: [DONE]
+//
+// Each "data: ..." line is one chunk. The stream ends with "data: [DONE]".
+// ──────────────────────────────────────────────────────
+func (p *OpenAIProvider) Stream(ctx context.Context, req *model.CompletionRequest, onChunk provider.StreamCallback) (*model.Usage, error) {
+
+	// ── Build the request body ──
+	//
+	// Same as Complete(), but with stream:true and stream_options.
+	//
+	// stream_options.include_usage tells OpenAI to include token counts
+	// in the final chunk. Without this, we can't bill the user.
+	type openaiMessage struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+
+	type streamOptions struct {
+		IncludeUsage bool `json:"include_usage"`
+	}
+
+	type openaiRequest struct {
+		Model         string          `json:"model"`
+		Messages      []openaiMessage `json:"messages"`
+		MaxTokens     int             `json:"max_tokens,omitempty"`
+		Temperature   float64         `json:"temperature,omitempty"`
+		Stream        bool            `json:"stream"`
+		StreamOptions streamOptions   `json:"stream_options"`
+	}
+
+	messages := make([]openaiMessage, len(req.Messages))
+	for i, msg := range req.Messages {
+		messages[i] = openaiMessage{Role: msg.Role, Content: msg.Content}
+	}
+
+	body := openaiRequest{
+		Model:         req.Model,
+		Messages:      messages,
+		MaxTokens:     req.MaxTokens,
+		Temperature:   req.Temperature,
+		Stream:        true,
+		StreamOptions: streamOptions{IncludeUsage: true},
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// ── Send the HTTP request ──
+	url := p.baseURL + "/chat/completions"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	httpReq.Header.Set("Content-Type", "application/json")
+	// Accept: text/event-stream tells the server we want SSE format
+	httpReq.Header.Set("Accept", "text/event-stream")
+
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("provider returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// ── Read the SSE stream line by line ──
+	//
+	// bufio.Scanner reads the response body line by line as data arrives.
+	// It doesn't wait for the full body — each Scan() returns the next line.
+	//
+	// This is the KEY to streaming: we process data as it arrives,
+	// not after the entire response is complete.
+	scanner := bufio.NewScanner(resp.Body)
+	// Increase buffer size — some chunks can be large
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var usage model.Usage
+
+	for scanner.Scan() {
+		// Check if client disconnected (context canceled)
+		if ctx.Err() != nil {
+			break
+		}
+
+		line := scanner.Text()
+
+		// SSE format: lines start with "data: "
+		// Empty lines separate events — skip them
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		// Extract the JSON after "data: "
+		data := strings.TrimPrefix(line, "data: ")
+
+		// "[DONE]" marks the end of the stream
+		if data == "[DONE]" {
+			break
+		}
+
+		// Parse the chunk JSON
+		//
+		// model.StreamChunk matches OpenAI's streaming format exactly:
+		//   {"id":"...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+		//
+		// The last chunk may also include a "usage" field with token counts.
+		var chunk model.StreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue // skip malformed chunks
+		}
+
+		// Forward the chunk to the handler via the callback
+		if err := onChunk(&chunk); err != nil {
+			return &usage, err // client disconnected or write failed
+		}
+
+		// Capture usage from the final chunk (OpenAI includes it when
+		// stream_options.include_usage is true)
+		if chunk.Usage != nil {
+			usage = *chunk.Usage
+		}
+	}
+
+	// Check for scanner errors (e.g., connection dropped mid-stream)
+	if err := scanner.Err(); err != nil {
+		return &usage, fmt.Errorf("stream read error: %w", err)
+	}
+
+	return &usage, nil
+}
+
+
 func (p *OpenAIProvider) Models() []model.ModelConfig {
 	return []model.ModelConfig{
 		{

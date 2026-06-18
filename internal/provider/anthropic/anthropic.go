@@ -1,15 +1,18 @@
 package anthropic
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/dreviz/openrouter/internal/model"
+	"github.com/dreviz/openrouter/internal/provider"
 )
 
 // ──────────────────────────────────────────────────────
@@ -210,7 +213,219 @@ func (p *AnthropicProvider) Complete(ctx context.Context, req *model.CompletionR
 	}, nil
 }
 
-// Models returns the models available from Anthropic.
+// ──────────────────────────────────────────────────────
+// Stream sends a streaming request to Anthropic.
+//
+// Anthropic's SSE format is DIFFERENT from OpenAI's:
+//
+// Anthropic sends events like this:
+//
+//	event: message_start
+//	data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":0}}}
+//
+//	event: content_block_delta
+//	data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}
+//
+//	event: message_delta
+//	data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}
+//
+//	event: message_stop
+//	data: {"type":"message_stop"}
+//
+// We convert these to OpenAI's streaming format (StreamChunk) so the
+// handler always sees the same shape regardless of provider.
+// ──────────────────────────────────────────────────────
+func (p *AnthropicProvider) Stream(ctx context.Context, req *model.CompletionRequest, onChunk provider.StreamCallback) (*model.Usage, error) {
+
+	// ── Build the request body (same as Complete, but stream:true) ──
+	type anthropicMessage struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+
+	type anthropicRequest struct {
+		Model     string             `json:"model"`
+		MaxTokens int                `json:"max_tokens"`
+		Messages  []anthropicMessage `json:"messages"`
+		System    string             `json:"system,omitempty"`
+		Stream    bool               `json:"stream"`
+	}
+
+	// Separate system messages from regular messages
+	var systemPrompt string
+	var messages []anthropicMessage
+	for _, msg := range req.Messages {
+		if msg.Role == "system" {
+			systemPrompt = msg.Content
+		} else {
+			messages = append(messages, anthropicMessage{Role: msg.Role, Content: msg.Content})
+		}
+	}
+
+	maxTokens := req.MaxTokens
+	if maxTokens == 0 {
+		maxTokens = 4096
+	}
+
+	body := anthropicRequest{
+		Model:     req.Model,
+		MaxTokens: maxTokens,
+		Messages:  messages,
+		System:    systemPrompt,
+		Stream:    true,
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// ── Send the HTTP request ──
+	url := p.baseURL + "/messages"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	httpReq.Header.Set("x-api-key", p.apiKey)
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := p.client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("anthropic returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// ── Read the SSE stream ──
+	//
+	// Anthropic sends both "event: ..." and "data: ..." lines.
+	// We only care about the "data: ..." lines — they contain the JSON.
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var usage model.Usage
+	var streamID string
+
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			break
+		}
+
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+
+		// Parse Anthropic's event format
+		var event struct {
+			Type         string `json:"type"`
+			Delta        *struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"delta"`
+			Message *struct {
+				ID    string `json:"id"`
+				Model string `json:"model"`
+				Usage struct {
+					InputTokens  int `json:"input_tokens"`
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
+			} `json:"message"`
+			Usage *struct {
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+		}
+
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+
+		switch event.Type {
+		case "message_start":
+			// First event — captures the message ID and input token count
+			if event.Message != nil {
+				streamID = event.Message.ID
+				usage.PromptTokens = event.Message.Usage.InputTokens
+			}
+
+		case "content_block_delta":
+			// A text chunk — convert to OpenAI's delta format
+			if event.Delta != nil && event.Delta.Type == "text_delta" {
+				chunk := model.StreamChunk{
+					ID:      streamID,
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   req.Model,
+				}
+				chunk.Choices = append(chunk.Choices, struct {
+					Index        int `json:"index"`
+					Delta        struct {
+						Role    string `json:"role,omitempty"`
+						Content string `json:"content,omitempty"`
+					} `json:"delta"`
+					FinishReason *string `json:"finish_reason"`
+				}{
+					Index: 0,
+					Delta: struct {
+						Role    string `json:"role,omitempty"`
+						Content string `json:"content,omitempty"`
+					}{
+						Content: event.Delta.Text,
+					},
+				})
+
+				if err := onChunk(&chunk); err != nil {
+					return &usage, err
+				}
+			}
+
+		case "message_delta":
+			// Near the end — includes output token count
+			if event.Usage != nil {
+				usage.CompletionTokens = event.Usage.OutputTokens
+			}
+
+		case "message_stop":
+			// Stream is done — send a final chunk with finish_reason
+			stopReason := "stop"
+			chunk := model.StreamChunk{
+				ID:      streamID,
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   req.Model,
+			}
+			chunk.Choices = append(chunk.Choices, struct {
+				Index        int `json:"index"`
+				Delta        struct {
+					Role    string `json:"role,omitempty"`
+					Content string `json:"content,omitempty"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			}{
+				Index:        0,
+				FinishReason: &stopReason,
+			})
+			onChunk(&chunk)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return &usage, fmt.Errorf("stream read error: %w", err)
+	}
+
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+	return &usage, nil
+}
+
+
 func (p *AnthropicProvider) Models() []model.ModelConfig {
 	return []model.ModelConfig{
 		{

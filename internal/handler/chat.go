@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/dreviz/openrouter/internal/middleware"
 	"github.com/dreviz/openrouter/internal/model"
+	"github.com/dreviz/openrouter/internal/provider"
 	"github.com/dreviz/openrouter/internal/registry"
 	"github.com/dreviz/openrouter/internal/store"
 	"github.com/google/uuid"
@@ -20,11 +22,11 @@ import (
 // Phase 1: Hardcoded proxy to OpenAI
 // Phase 2: Uses the registry to find the right provider
 // Phase 3: Adds authentication + billing
+// Phase 4: Adds streaming support (SSE)
 //
-// What changed in Phase 3:
-//   - Now depends on *store.Store (for billing)
-//   - Reads user from context (set by RequireAPIKey middleware)
-//   - Calculates cost after each request and deducts credits
+// The handler now has two code paths:
+//   - Normal:   wait for full response, return as JSON
+//   - Streaming: forward tokens one at a time as SSE chunks
 // ──────────────────────────────────────────────────────
 type ChatHandler struct {
 	registry *registry.Registry
@@ -32,7 +34,6 @@ type ChatHandler struct {
 	logger   *slog.Logger
 }
 
-// NewChatHandler creates a handler with registry + store + logger.
 func NewChatHandler(reg *registry.Registry, s *store.Store, logger *slog.Logger) *ChatHandler {
 	return &ChatHandler{
 		registry: reg,
@@ -42,40 +43,31 @@ func NewChatHandler(reg *registry.Registry, s *store.Store, logger *slog.Logger)
 }
 
 // ServeHTTP handles POST /v1/chat/completions.
-//
-// The flow is now:
-//  1. Parse the incoming request
-//  2. Look up the model in the registry
-//  3. Convert ChatRequest → CompletionRequest (our internal format)
-//  4. Call provider.Complete() — provider handles the rest
-//  5. Convert CompletionResponse → ChatResponse (OpenAI format)
-//  6. Calculate cost and deduct credits
-//  7. Return to caller
 func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
-	// ── Get user from context (set by RequireAPIKey middleware) ──
 	user, ok := middleware.UserFromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "not authenticated")
 		return
 	}
 
-	// ── STEP 1: Parse the incoming JSON ──
 	var req model.ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 
-	// ── STEP 2: Look up the model in the registry ──
-	provider, modelConfig, err := h.registry.Resolve(req.Model)
+	// Resolve the provider from the registry
+	//
+	// We use variable name "p" instead of "provider" to avoid
+	// colliding with the imported package name "provider".
+	p, modelConfig, err := h.registry.Resolve(req.Model)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// ── STEP 3: Convert ChatRequest → CompletionRequest ──
 	maxTokens := 0
 	if req.MaxTokens != nil {
 		maxTokens = *req.MaxTokens
@@ -93,19 +85,43 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Stream:      req.Stream,
 	}
 
-	// ── STEP 4: Call the provider ──
-	resp, err := provider.Complete(r.Context(), completionReq)
+	// ── BRANCH: streaming vs non-streaming ──
+	//
+	// Phase 4: if the client asked for streaming (stream: true),
+	// we take a completely different code path.
+	if req.Stream {
+		h.handleStream(w, r, p, modelConfig, completionReq, user, start)
+		return
+	}
+
+	h.handleComplete(w, r, p, modelConfig, completionReq, user, start)
+}
+
+// ──────────────────────────────────────────────────────
+// handleComplete — the non-streaming path (Phase 1-3)
+//
+// Same flow as before: call provider.Complete, get full response, return JSON.
+// ──────────────────────────────────────────────────────
+func (h *ChatHandler) handleComplete(
+	w http.ResponseWriter,
+	r *http.Request,
+	p provider.Provider,
+	modelConfig model.ModelConfig,
+	req *model.CompletionRequest,
+	user middleware.ContextUser,
+	start time.Time,
+) {
+	resp, err := p.Complete(r.Context(), req)
 	if err != nil {
 		h.logger.Error("provider request failed",
 			"model", req.Model,
-			"provider", provider.Name(),
+			"provider", p.Name(),
 			"error", err,
 		)
 		writeError(w, http.StatusBadGateway, "upstream error: "+err.Error())
 		return
 	}
 
-	// ── STEP 5: Convert CompletionResponse → ChatResponse ──
 	chatResp := model.ChatResponse{
 		ID:      resp.ID,
 		Object:  "chat.completion",
@@ -115,33 +131,9 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Usage:   resp.Usage,
 	}
 
-	// ── STEP 6: Calculate cost and deduct credits ──
-	//
-	// Pricing: ModelConfig has InputPrice and OutputPrice per 1M tokens.
-	//   cost = (prompt_tokens × input_price + completion_tokens × output_price) / 1,000,000
-	//
-	// Example: 100 prompt tokens at $3.00/1M = $0.0003
-	//          200 completion tokens at $15.00/1M = $0.003
-	//          Total = $0.0033
 	cost := calculateCost(resp.Usage, modelConfig)
+	h.deductCredits(r.Context(), user, cost)
 
-	// Parse user ID for billing
-	userID, parseErr := parseUserID(user.ID)
-	if parseErr != nil {
-		h.logger.Error("invalid user id in context", "error", parseErr)
-	} else if err := h.store.DeductCredits(r.Context(), userID, cost); err != nil {
-		// Billing failed — but we already called the provider.
-		// The tokens are spent. We can't un-send them.
-		// Log a warning and continue. In production, you'd flag this
-		// for manual review and potentially suspend the account.
-		h.logger.Warn("failed to deduct credits",
-			"user_id", user.ID,
-			"cost", cost,
-			"error", err,
-		)
-	}
-
-	// ── STEP 7: Send the response ──
 	respBytes, err := json.Marshal(chatResp)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to marshal response")
@@ -154,9 +146,8 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.Info("request completed",
 		"model", req.Model,
-		"provider", provider.Name(),
+		"provider", p.Name(),
 		"user", user.Email,
-		"status", 200,
 		"latency_ms", time.Since(start).Milliseconds(),
 		"tokens_in", resp.Usage.PromptTokens,
 		"tokens_out", resp.Usage.CompletionTokens,
@@ -164,16 +155,126 @@ func (h *ChatHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 }
 
-// calculateCost computes the USD cost for a request based on token usage.
+// ──────────────────────────────────────────────────────
+// handleStream — the streaming path (Phase 4)
+//
+// Instead of waiting for the full response, we:
+//  1. Set SSE headers (tells the client "I'm going to send chunks")
+//  2. Call provider.Stream() with a callback
+//  3. The callback writes each chunk as "data: <json>\n\n" + flush
+//  4. After streaming finishes, deduct credits based on token usage
+//
+// WHY FLUSH MATTERS:
+// Go's HTTP response writer BUFFERS data by default (groups small writes).
+// In streaming, we want each chunk sent IMMEDIATELY to the client.
+// http.Flusher.Flush() forces the buffer out right now.
+//
+// IMPORTANT: Once we write the 200 status header, we CANNOT change it.
+// If the provider errors mid-stream, we can only write an error chunk,
+// not return a different HTTP status code.
+// ──────────────────────────────────────────────────────
+func (h *ChatHandler) handleStream(
+	w http.ResponseWriter,
+	r *http.Request,
+	p provider.Provider,
+	modelConfig model.ModelConfig,
+	req *model.CompletionRequest,
+	user middleware.ContextUser,
+	start time.Time,
+) {
+	// ── Set SSE response headers ──
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	// Get the flusher if the ResponseWriter supports it
+	flusher, canFlush := w.(http.Flusher)
+
+	// ── Call provider.Stream with a callback ──
+	//
+	// For every chunk the provider receives, our callback:
+	//   1. Marshals it to JSON
+	//   2. Writes "data: <json>\n\n" (SSE format)
+	//   3. Flushes to push it to the client immediately
+	usage, err := p.Stream(r.Context(), req, func(chunk *model.StreamChunk) error {
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		if canFlush {
+			flusher.Flush()
+		}
+		return nil
+	})
+
+	// ── Handle errors mid-stream ──
+	//
+	// We can't change HTTP status (already sent 200).
+	// We send the error as a final SSE chunk.
+	if err != nil {
+		h.logger.Error("stream failed",
+			"model", req.Model,
+			"provider", p.Name(),
+			"error", err,
+		)
+		errorData, _ := json.Marshal(map[string]string{"error": err.Error()})
+		fmt.Fprintf(w, "data: %s\n\n", errorData)
+		if canFlush {
+			flusher.Flush()
+		}
+	}
+
+	// ── Send [DONE] marker ──
+	//
+	// This tells the client "the stream is finished."
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	if canFlush {
+		flusher.Flush()
+	}
+
+	// ── Deduct credits based on usage ──
+	cost := calculateCost(*usage, modelConfig)
+	h.deductCredits(r.Context(), user, cost)
+
+	h.logger.Info("stream completed",
+		"model", req.Model,
+		"provider", p.Name(),
+		"user", user.Email,
+		"latency_ms", time.Since(start).Milliseconds(),
+		"tokens_in", usage.PromptTokens,
+		"tokens_out", usage.CompletionTokens,
+		"cost_usd", fmt.Sprintf("%.6f", cost),
+	)
+}
+
+// ─── Helpers ───
+
+// deductCredits deducts cost from the user's balance.
+// Errors are logged but don't fail the request — the response is already sent.
+func (h *ChatHandler) deductCredits(ctx context.Context, user middleware.ContextUser, cost float64) {
+	userID, err := uuid.Parse(user.ID)
+	if err != nil {
+		h.logger.Error("invalid user id for billing", "error", err)
+		return
+	}
+	if err := h.store.DeductCredits(ctx, userID, cost); err != nil {
+		// Billing failed but we already sent the response.
+		// Log and continue — in production, flag this for review.
+		h.logger.Warn("failed to deduct credits",
+			"user_id", user.ID,
+			"cost", cost,
+			"error", err,
+		)
+	}
+}
+
+// calculateCost computes the USD cost based on token usage and model pricing.
 func calculateCost(usage model.Usage, config model.ModelConfig) float64 {
 	inputCost := float64(usage.PromptTokens) * config.InputPrice / 1_000_000
 	outputCost := float64(usage.CompletionTokens) * config.OutputPrice / 1_000_000
 	return inputCost + outputCost
-}
-
-// parseUserID converts a string user ID to uuid.UUID.
-func parseUserID(s string) (uuid.UUID, error) {
-	return uuid.Parse(s)
 }
 
 // writeError sends a JSON error response in OpenAI format.

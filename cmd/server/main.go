@@ -103,7 +103,7 @@ func main() {
 	//	POST /v1/keys                 → keysHandler.Create       (JWT required)
 	//	GET  /v1/keys                 → keysHandler.List         (JWT required)
 	//	DELETE /v1/keys/{id}          → keysHandler.Deactivate   (JWT required)
-	//	POST /v1/chat/completions     → chatHandler              (API key required)
+	//	POST /v1/chat/completions     → chatHandler              (API key + rate limited)
 	//	GET  /health                  → health check             (no auth)
 	//
 	// Middleware wraps a handler. The syntax is:
@@ -129,8 +129,18 @@ func main() {
 	mux.Handle("DELETE /v1/keys/{id}", jwtAuth(http.HandlerFunc(keysHandler.Deactivate)))
 
 	// Protected routes (API key auth — for chat completions)
+	//
+	// Middleware chain for chat completions:
+	//   RequireAPIKey → RateLimiter → ChatHandler
+	//
+	// 1. RequireAPIKey checks the API key is valid and loads the user
+	// 2. RateLimiter checks the user hasn't exceeded their request quota
+	// 3. ChatHandler processes the actual chat request
+	//
+	// Rate limit: 20 requests per minute per user (free tier)
 	apiKeyAuth := middleware.RequireAPIKey(db, logger)
-	mux.Handle("POST /v1/chat/completions", apiKeyAuth(chatHandler))
+	rateLimiter := middleware.NewRateLimiter(20, time.Minute, logger)
+	mux.Handle("POST /v1/chat/completions", apiKeyAuth(rateLimiter.Middleware(chatHandler)))
 
 	// ──────────────────────────────────────────────
 	// Start server with graceful shutdown
