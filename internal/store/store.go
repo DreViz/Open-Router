@@ -48,7 +48,18 @@ func New(ctx context.Context, databaseURL, migrationsPath string, logger *slog.L
 	// If there are new migrations, it runs only the new ones.
 	//
 	// This way the database schema is always up to date.
-	runMigrations(migrationsPath, databaseURL, logger)
+	// ── Run migrations first ──
+	//
+	// Migrations are SQL files that create/modify tables.
+	// We run them every time the server starts.
+	// If the tables already exist, migrate knows and skips them.
+	// If there are new migrations, it runs only the new ones.
+	//
+	// If migrations fail, we return an error — the server MUST NOT
+	// start with an inconsistent database schema.
+	if err := runMigrations(migrationsPath, databaseURL, logger); err != nil {
+		return nil, err
+	}
 
 	// ── Connect to PostgreSQL ──
 	//
@@ -71,20 +82,21 @@ func New(ctx context.Context, databaseURL, migrationsPath string, logger *slog.L
 }
 
 // runMigrations runs all pending SQL migration files.
-func runMigrations(migrationsPath, databaseURL string, logger *slog.Logger) {
+// Returns an error if migrations fail — the server should NOT start
+// with an inconsistent database schema.
+func runMigrations(migrationsPath, databaseURL string, logger *slog.Logger) error {
 	m, err := migrate.New(migrationsPath, "pgx5://"+databaseURL[len("postgres://"):])
 	if err != nil {
-		logger.Warn("migration setup failed", "error", err)
-		return
+		return fmt.Errorf("migration setup failed: %w", err)
 	}
 	defer m.Close()
 
 	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
-		logger.Warn("migration failed", "error", err)
-		return
+		return fmt.Errorf("migration failed: %w", err)
 	}
 
 	logger.Info("database migrations applied")
+	return nil
 }
 
 // Close shuts down the connection pool.

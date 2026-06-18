@@ -118,7 +118,7 @@ func (h *AuthHandler) Signup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate first API key
-	apiKey, err := generateAPIKey(h.store, r.Context(), user.ID, "default-key")
+	_, apiKey, err := generateAPIKey(h.store, r.Context(), user.ID, "default-key")
 	if err != nil {
 		h.logger.Error("failed to generate api key", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to setup account")
@@ -215,11 +215,11 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 //
 // The full key is NEVER stored anywhere. Only the hash is stored.
 // When a request comes in, we hash the provided key and compare to the DB.
-func generateAPIKey(s *store.Store, ctx context.Context, userID uuid.UUID, name string) (string, error) {
+func generateAPIKey(s *store.Store, ctx context.Context, userID uuid.UUID, name string) (*store.APIKey, string, error) {
 	// Step 1: Generate 32 random bytes
 	rawBytes := make([]byte, 32)
 	if _, err := rand.Read(rawBytes); err != nil {
-		return "", fmt.Errorf("failed to generate random bytes: %w", err)
+		return nil, "", fmt.Errorf("failed to generate random bytes: %w", err)
 	}
 
 	// Step 2: Hex encode → "a3b1c5d7e9f24a6b..."
@@ -235,14 +235,14 @@ func generateAPIKey(s *store.Store, ctx context.Context, userID uuid.UUID, name 
 	// Step 5: Prefix (first 12 chars, for display)
 	keyPrefix := fullKey[:12]
 
-	// Step 6: Store hash + prefix in DB
-	_, err := s.CreateAPIKey(ctx, userID, name, keyHash, keyPrefix)
+	// Step 6: Store hash + prefix in DB — get the row back for the ID
+	keyRow, err := s.CreateAPIKey(ctx, userID, name, keyHash, keyPrefix)
 	if err != nil {
-		return "", fmt.Errorf("failed to store api key: %w", err)
+		return nil, "", fmt.Errorf("failed to store api key: %w", err)
 	}
 
-	// Return the full key — this is the ONLY time it's ever visible
-	return fullKey, nil
+	// Return the DB row (has the real ID) + the full key (shown only once)
+	return keyRow, fullKey, nil
 }
 
 // ─── Helper: Generate JWT ──

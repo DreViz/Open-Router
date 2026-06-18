@@ -77,7 +77,7 @@ func (h *KeysHandler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Generate the API key (shared function in auth.go)
-	fullKey, err := generateAPIKey(h.store, r.Context(), userID, req.Name)
+	keyRow, fullKey, err := generateAPIKey(h.store, r.Context(), userID, req.Name)
 	if err != nil {
 		h.logger.Error("failed to generate api key", "error", err)
 		writeError(w, http.StatusInternalServerError, "failed to create api key")
@@ -89,7 +89,7 @@ func (h *KeysHandler) Create(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(CreateKeyResponse{
-		ID:        userID.String()[:8],
+		ID:        keyRow.ID.String(),
 		Name:      req.Name,
 		Key:       fullKey,
 		KeyPrefix: fullKey[:12],
@@ -168,9 +168,15 @@ func (h *KeysHandler) Deactivate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.store.DeactivateAPIKey(r.Context(), keyID); err != nil {
+	userID, err := uuid.Parse(user.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "invalid user id")
+		return
+	}
+
+	if err := h.store.DeactivateAPIKey(r.Context(), keyID, userID); err != nil {
 		h.logger.Error("failed to deactivate key", "error", err)
-		writeError(w, http.StatusInternalServerError, "failed to deactivate key")
+		writeError(w, http.StatusNotFound, "key not found")
 		return
 	}
 

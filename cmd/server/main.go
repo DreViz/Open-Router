@@ -143,6 +143,18 @@ func main() {
 	mux.Handle("POST /v1/chat/completions", apiKeyAuth(rateLimiter.Middleware(chatHandler)))
 
 	// ──────────────────────────────────────────────
+	// Wrap the entire router with CORS middleware
+	// ──────────────────────────────────────────────
+	//
+	// CORS must be the OUTERMOST middleware — it needs to intercept
+	// every request, including preflight OPTIONS requests, before
+	// any auth middleware runs.
+	//
+	// In production, replace localhost:3000 with your real frontend domain.
+	corsMiddleware := middleware.CORS("http://localhost:3000", logger)
+	handler := corsMiddleware(mux)
+
+	// ──────────────────────────────────────────────
 	// Start server with graceful shutdown
 	// ──────────────────────────────────────────────
 	//
@@ -157,7 +169,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.Port,
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 		IdleTimeout:  120 * time.Second,

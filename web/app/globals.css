@@ -1,0 +1,96 @@
+@import "tailwindcss";
+
+/*
+ * ─── Dark Theme Design System ───
+ *
+ * Inspired by Vercel, Linear, and OpenRouter.
+ *
+ * Color palette:
+ *   background:  near-black (#0a0a0a)
+ *   surface:     card backgrounds (#141414)
+ *   border:      subtle borders (#262626)
+ *   foreground:  text colors
+ *   accent:      emerald (#10b981) — the primary action color
+ */
+
+:root {
+  /* Backgrounds */
+  --background: #0a0a0a;
+  --surface: #141414;
+  --surface-hover: #1a1a1a;
+
+  /* Text */
+  --foreground: #fafafa;
+  --foreground-muted: #a3a3a3;
+  --foreground-dim: #525252;
+
+  /* Borders */
+  --border: #262626;
+  --border-hover: #404040;
+
+  /* Accent (emerald) */
+  --accent: #10b981;
+  --accent-hover: #059669;
+  --accent-foreground: #ffffff;
+
+  /* Status colors */
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --info: #3b82f6;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-hover: var(--surface-hover);
+  --color-foreground: var(--foreground);
+  --color-foreground-muted: var(--foreground-muted);
+  --color-foreground-dim: var(--foreground-dim);
+  --color-border: var(--border);
+  --color-border-hover: var(--border-hover);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --color-info: var(--info);
+
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+* {
+  border-color: var(--border);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--background);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-hover);
+}
+
+/* Smooth transitions for interactive elements */
+button, a {
+  transition: all 0.15s ease;
+}

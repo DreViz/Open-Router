@@ -94,13 +94,20 @@ func (s *Store) ListAPIKeysByUser(ctx context.Context, userID uuid.UUID) ([]APIK
 
 // DeactivateAPIKey sets is_active = false on an API key.
 // This "revokes" the key — it can no longer be used.
-func (s *Store) DeactivateAPIKey(ctx context.Context, keyID uuid.UUID) error {
-	_, err := s.db.Exec(ctx,
-		`UPDATE api_keys SET is_active = false WHERE id = $1`,
-		keyID,
+//
+// SECURITY: The user_id check ensures a user can only deactivate
+// THEIR OWN keys. Without it, any authenticated user could revoke
+// any key by guessing its UUID.
+func (s *Store) DeactivateAPIKey(ctx context.Context, keyID, userID uuid.UUID) error {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE api_keys SET is_active = false WHERE id = $1 AND user_id = $2`,
+		keyID, userID,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to deactivate api key: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("key not found or not owned by user")
 	}
 	return nil
 }
